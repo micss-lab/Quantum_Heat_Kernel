@@ -6,8 +6,7 @@ This is the heterophilic companion of the attached homophily script and keeps
 its code organization, tune-once/freeze protocol, split-level reporting, and
 paper-report outputs.  It evaluates:
 
-    MLP, GCN, GAT, GraphSAGE,
-    H2GCN, MixHop,
+    GCN, GAT, GraphSAGE,
     Heat-GCN, Frac-Heat, Mixed-Graph-Frac-Heat,
     QE-HGNN, QFK-HGNN, QEF-HGNN
 
@@ -112,8 +111,7 @@ DATASET_CLASSES = {
 }
 
 BENCHMARK_METHODS = [
-    "MLP", "GCN", "GAT", "GraphSAGE",
-    "H2GCN", "MixHop",
+    "GCN", "GAT", "GraphSAGE",
     "Heat-GCN", "Frac-Heat",
 ]
 MATCHED_CONTROL_METHODS = ["Mixed-Graph-Frac-Heat"]
@@ -122,9 +120,7 @@ OPERATOR_METHODS = MATCHED_CONTROL_METHODS + QEF_FAMILY_METHODS
 RUN_METHODS = BENCHMARK_METHODS + OPERATOR_METHODS
 
 METHOD_GROUPS: List[Tuple[str, List[str]]] = [
-    ("Feature-only baseline", ["MLP"]),
     ("Classical message-passing methods", ["GCN", "GAT", "GraphSAGE"]),
-    ("Heterophily-aware and higher-order methods", ["H2GCN", "MixHop"]),
     ("Spectral and diffusion methods", ["Heat-GCN", "Frac-Heat"]),
     ("Matched semantic control", ["Mixed-Graph-Frac-Heat"]),
     ("Operator variants and full model", ["QE-HGNN", "QFK-HGNN", "QEF-HGNN"]),
@@ -135,8 +131,7 @@ SEEDS = list(range(10))
 # then frozen and reused for all final evaluation seeds.
 # Hyperparameters are selected once on one dedicated tuning split and then
 # frozen across the ten reported evaluation seeds 0,...,9.  This keeps tuning
-# leakage-free while avoiding the 3x training multiplier that made MixHop on
-# Chameleon appear to hang.
+# leakage-free while avoiding an unnecessary 3x training multiplier.
 TUNING_SEEDS = [1000]
 TRAIN_PER_CLASS = 4
 # Explicit reproducibility choice: validation is class-balanced and disjoint.
@@ -177,10 +172,8 @@ NEURAL_DROPOUT_GRID = [0.50, 0.70]
 NEURAL_LR_GRID = [0.005, 0.010]
 NEURAL_WEIGHT_DECAY_GRID = [5e-4, 5e-3]
 GAT_HEADS_GRID = [4, 8]
-H2_LAYERS_GRID = [1, 2]
 HEAT_TIME_GRID = [0.50, 1.00, 2.00, 5.00]
 FRAC_ORDER_GRID = [0.50, 0.70, 0.85]
-MIXHOP_POWERS = (0, 1, 2)
 
 # Algorithm-2 downstream grids.
 S_GRID = [0.50, 0.70, 0.85, 1.00]
@@ -204,13 +197,6 @@ QEF_SEMANTIC_RESIDUAL_GRID = [0.00, 0.25, 0.50, 0.75, 1.00]
 QEF_CORRECTION_RESIDUAL_GRID = [0.00, 0.50, 1.00, 1.50, 2.00]
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# Runtime correction for MixHop.  The first MixHop layer repeatedly needs
-# X, A X, and A^2 X.  On Chameleon, recomputing A X and A^2 X inside every
-# epoch/trial dominates runtime.  These input powers are label-free and fixed,
-# so precomputing them once per dataset/device is mathematically exact.
-MIXHOP_PRECOMPUTE_INPUT_POWERS = True
-_MIXHOP_GRAPH_CACHE: Dict[Tuple[str, str], Dict[str, torch.Tensor]] = {}
 
 # Optuna pruning is used only during hyperparameter selection.  It does not
 # change final evaluation: the selected configuration is still retrained from
@@ -939,49 +925,6 @@ def row_normalised_adjacency(A: sp.csr_matrix) -> sp.csr_matrix:
     return (sp.diags(inv) @ A).tocsr()
 
 
-def strict_one_two_hop_adjacencies(
-    W: sp.csr_matrix,
-    dataset_name: str,
-) -> Tuple[sp.csr_matrix, sp.csr_matrix]:
-    cache_dir = GRAPH_CACHE_ROOT / dataset_name
-    one_path = cache_dir / "h2_a1.npz"
-    two_path = cache_dir / "h2_a2.npz"
-    if one_path.exists() and two_path.exists():
-        return sp.load_npz(one_path).tocsr(), sp.load_npz(two_path).tocsr()
-
-    A = W.astype(np.float64).tocsr(copy=True)
-    A.data[:] = 1.0
-    A.setdiag(0.0)
-    A.eliminate_zeros()
-
-    A2 = (A @ A).tocsr()
-    A2.data[:] = 1.0
-    # Strict two-hop neighbourhood: remove one-hop edges and self-connections.
-    A2 = A2 - A2.multiply(A)
-    A2.data[A2.data < 0.0] = 0.0
-    A2.setdiag(0.0)
-    A2.eliminate_zeros()
-    A2.data[:] = 1.0
-
-    A1n = row_normalised_adjacency(A)
-    A2n = row_normalised_adjacency(A2)
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    sp.save_npz(one_path, A1n)
-    sp.save_npz(two_path, A2n)
-    return A1n, A2n
-
-
-def scipy_to_torch_sparse(A: sp.csr_matrix, device: torch.device) -> torch.Tensor:
-    coo = A.tocoo()
-    indices = torch.as_tensor(
-        np.vstack([coo.row, coo.col]), dtype=torch.long, device=device
-    )
-    values = torch.as_tensor(coo.data, dtype=torch.float32, device=device)
-    return torch.sparse_coo_tensor(
-        indices, values, size=coo.shape, device=device
-    ).coalesce()
-
-
 def scipy_to_edge_tensors(
     A: sp.csr_matrix,
     device: torch.device,
@@ -1100,117 +1043,6 @@ class GraphSAGENet(nn.Module):
         return self.conv2(x, edge_index)
 
 
-class H2GCNNet(nn.Module):
-    """Strict 1-/2-hop H2GCN-style benchmark with ego separation."""
-
-    def __init__(
-        self,
-        in_dim: int,
-        hidden: int,
-        classes: int,
-        dropout: float,
-        layers: int,
-    ):
-        super().__init__()
-        self.embed = nn.Linear(in_dim, hidden)
-        representation_dim = hidden * sum(2 ** level for level in range(layers + 1))
-        self.classifier = nn.Linear(representation_dim, classes)
-        self.dropout = dropout
-        self.layers = layers
-
-    def forward(self, x: torch.Tensor, graph: Mapping[str, torch.Tensor]) -> torch.Tensor:
-        a1 = graph["a1"]
-        a2 = graph["a2"]
-        h = F.relu(self.embed(x))
-        representations = [h]
-        for _ in range(self.layers):
-            one_hop = torch.sparse.mm(a1, h)
-            two_hop = torch.sparse.mm(a2, h)
-            h = torch.cat([one_hop, two_hop], dim=1)
-            representations.append(h)
-        z = torch.cat(representations, dim=1)
-        z = F.dropout(z, p=self.dropout, training=self.training)
-        return self.classifier(z)
-
-
-
-class MixHopLayer(nn.Module):
-    def __init__(self, in_dim: int, out_per_power: int, powers: Sequence[int]):
-        super().__init__()
-        self.powers = tuple(sorted(set(int(p) for p in powers)))
-        self.linears = nn.ModuleDict(
-            {str(p): nn.Linear(in_dim, out_per_power) for p in self.powers}
-        )
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        a_norm: torch.Tensor,
-        precomputed_powers: Mapping[int, torch.Tensor] | None = None,
-    ) -> torch.Tensor:
-        """
-        Apply independent linear maps to adjacency powers.
-
-        For the first layer, powers of the fixed input feature matrix may be
-        supplied through ``precomputed_powers``.  This is exactly equivalent to
-        recomputing A^p X every epoch because X and A are constants and the
-        learnable linear map is applied only after propagation.
-        """
-        outputs: List[torch.Tensor] = []
-
-        if precomputed_powers is not None:
-            for power in self.powers:
-                propagated = precomputed_powers.get(power)
-                if propagated is None:
-                    propagated = x
-                    for _ in range(power):
-                        propagated = torch.sparse.mm(a_norm, propagated)
-                outputs.append(self.linears[str(power)](propagated))
-            return torch.cat(outputs, dim=1)
-
-        propagated = x
-        max_power = max(self.powers)
-        for power in range(max_power + 1):
-            if power in self.powers:
-                outputs.append(self.linears[str(power)](propagated))
-            if power < max_power:
-                propagated = torch.sparse.mm(a_norm, propagated)
-        return torch.cat(outputs, dim=1)
-
-
-class MixHopNet(nn.Module):
-    def __init__(self, in_dim: int, hidden: int, classes: int, dropout: float):
-        super().__init__()
-        width = max(8, hidden // len(MIXHOP_POWERS))
-        first_dim = width * len(MIXHOP_POWERS)
-        self.layer1 = MixHopLayer(in_dim, width, MIXHOP_POWERS)
-        self.layer2 = MixHopLayer(first_dim, width, MIXHOP_POWERS)
-        self.classifier = nn.Linear(first_dim, classes)
-        self.dropout = dropout
-
-    def forward(self, x: torch.Tensor, graph: Mapping[str, torch.Tensor]) -> torch.Tensor:
-        a_norm = graph["a_norm"]
-        input_power_cache: Dict[int, torch.Tensor] | None = None
-        if "x_power_1" in graph and "x_power_2" in graph:
-            input_power_cache = {
-                0: x,
-                1: graph["x_power_1"],
-                2: graph["x_power_2"],
-            }
-
-        x = F.relu(
-            self.layer1(
-                x,
-                a_norm,
-                precomputed_powers=input_power_cache,
-            )
-        )
-        x = F.dropout(x, p=self.dropout, training=self.training)
-        x = F.relu(self.layer2(x, a_norm))
-        x = F.dropout(x, p=self.dropout, training=self.training)
-        return self.classifier(x)
-
-
 def neural_config_candidates(method: str, dataset_name: str) -> List[NeuralConfig]:
     common = itertools.product(
         NEURAL_HIDDEN_GRID,
@@ -1225,11 +1057,6 @@ def neural_config_candidates(method: str, dataset_name: str) -> List[NeuralConfi
             for heads in GAT_HEADS_GRID:
                 configs.append(
                     NeuralConfig(method, hidden, dropout, lr, wd, heads=heads)
-                )
-        elif method == "H2GCN":
-            for layers in H2_LAYERS_GRID:
-                configs.append(
-                    NeuralConfig(method, hidden, dropout, lr, wd, h2_layers=layers)
                 )
         elif method == "Heat-GCN":
             for heat_t in HEAT_TIME_GRID:
@@ -1786,8 +1613,7 @@ def save_incremental(
 #   5) QEF-family code receives only the labels of the initial training set;
 #   6) the first-order retained-eigenspace Duhamel kernel is explicitly treated
 #      as an approximation before nonlinear affinity post-processing;
-#   7) the paper's Mixed-Graph-Frac-Heat matched semantic control is executable;
-#   8) the paper's feature-only MLP baseline is executable.
+#   7) the paper's Mixed-Graph-Frac-Heat matched semantic control is executable.
 #
 # Publication mode follows Algorithm 1's nominal cap B=100.  FAST_DEBUG_MODE
 # can be enabled only for debugging; results from that mode must not be reported
@@ -1813,7 +1639,6 @@ class NeuralConfig:
     max_epochs: int = NEURAL_MAX_EPOCHS
     patience: int = NEURAL_PATIENCE
     heads: int = 4
-    h2_layers: int = 2
     gpr_k: int = 10
     gpr_alpha: float = 0.10
     heat_t: float = 1.0
@@ -1833,7 +1658,7 @@ class NeuralConfig:
             raise ValueError("Invalid optimiser parameters")
         if self.max_epochs < 1 or self.patience < 1:
             raise ValueError("Training budget must be positive")
-        if self.heads < 1 or self.h2_layers < 1 or self.gpr_k < 1:
+        if self.heads < 1 or self.gpr_k < 1:
             raise ValueError("Architecture depth/order must be positive")
         if not (0.0 < self.gpr_alpha < 1.0):
             raise ValueError("gpr_alpha must be in (0,1)")
@@ -1871,79 +1696,19 @@ class MixedGraphConfig:
             raise ValueError("affinity_topk must be positive")
 
 
-class MLPNet(nn.Module):
-    """Feature-only two-layer MLP baseline."""
-
-    def __init__(self, in_dim: int, hidden: int, classes: int, dropout: float):
-        super().__init__()
-        self.fc1 = nn.Linear(in_dim, hidden)
-        self.fc2 = nn.Linear(hidden, classes)
-        self.dropout = dropout
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        graph: Mapping[str, torch.Tensor],
-    ) -> torch.Tensor:
-        del graph
-        x = F.relu(self.fc1(x))
-        x = F.dropout(x, p=self.dropout, training=self.training)
-        return self.fc2(x)
-
-
 def build_neural_model(
     config: NeuralConfig,
     in_dim: int,
     classes: int,
 ) -> nn.Module:
     config.validate()
-    if config.method == "MLP":
-        return MLPNet(in_dim, config.hidden, classes, config.dropout)
     if config.method in {"GCN", "Heat-GCN", "Frac-Heat"}:
         return GCNNet(in_dim, config.hidden, classes, config.dropout)
     if config.method == "GAT":
         return GATNet(in_dim, config.hidden, classes, config.dropout, config.heads)
     if config.method == "GraphSAGE":
         return GraphSAGENet(in_dim, config.hidden, classes, config.dropout)
-    if config.method == "H2GCN":
-        return H2GCNNet(
-            in_dim, config.hidden, classes, config.dropout, config.h2_layers
-        )
-    if config.method == "MixHop":
-        return MixHopNet(in_dim, config.hidden, classes, config.dropout)
     raise ValueError(config.method)
-
-
-def prepare_mixhop_graph_cached(
-    bundle: DatasetBundle,
-    device: torch.device,
-) -> Dict[str, torch.Tensor]:
-    """Build MixHop graph tensors once and cache fixed input powers A X, A^2 X."""
-    key = (bundle.name, str(device))
-    cached = _MIXHOP_GRAPH_CACHE.get(key)
-    if cached is not None:
-        return cached
-
-    a_norm_sp = symmetric_normalised_adjacency(bundle.W, add_self_loops=True)
-    a_norm = scipy_to_torch_sparse(a_norm_sp, device)
-    graph: Dict[str, torch.Tensor] = {"a_norm": a_norm}
-
-    if MIXHOP_PRECOMPUTE_INPUT_POWERS:
-        print(
-            f"    MixHop cache: precomputing A X and A^2 X once for {bundle.name} "
-            f"on {device} ..."
-        )
-        with torch.no_grad():
-            x0 = torch.as_tensor(bundle.X, dtype=torch.float32, device=device)
-            x1 = torch.sparse.mm(a_norm, x0).detach()
-            x2 = torch.sparse.mm(a_norm, x1).detach()
-        # X itself is already provided to model.forward; cache only the two
-        # expensive propagated feature blocks to keep memory bounded.
-        graph["x_power_1"] = x1
-        graph["x_power_2"] = x2
-
-    _MIXHOP_GRAPH_CACHE[key] = graph
-    return graph
 
 
 def prepare_neural_graph(
@@ -1952,8 +1717,6 @@ def prepare_neural_graph(
     device: torch.device,
 ) -> Dict[str, torch.Tensor]:
     method = config.method
-    if method == "MLP":
-        return {}
     if method in {"GCN", "GAT", "GraphSAGE"}:
         edge_index, edge_weight = scipy_to_edge_tensors(bundle.W, device)
         graph = {"edge_index": edge_index}
@@ -1966,25 +1729,14 @@ def prepare_neural_graph(
         )
         edge_index, edge_weight = scipy_to_edge_tensors(affinity, device)
         return {"edge_index": edge_index, "edge_weight": edge_weight}
-    if method == "H2GCN":
-        a1, a2 = strict_one_two_hop_adjacencies(bundle.W, bundle.name)
-        return {
-            "a1": scipy_to_torch_sparse(a1, device),
-            "a2": scipy_to_torch_sparse(a2, device),
-        }
-    if method == "MixHop":
-        return prepare_mixhop_graph_cached(bundle, device)
     raise ValueError(method)
 
 
 def benchmark_implementation_label(method: str) -> str:
     labels = {
-        "MLP": "feature-only two-layer MLP",
         "GCN": "two-layer PyG GCNConv",
         "GAT": "two-layer multi-head PyG GATConv",
         "GraphSAGE": "two-layer mean-aggregation PyG SAGEConv",
-        "H2GCN": "ego-separated strict 1-hop/2-hop H2GCN-style network",
-        "MixHop": "two-layer adjacency-power mixing with powers 0,1,2",
         "Heat-GCN": "weighted GCN on top-k standard heat-kernel affinity",
         "Frac-Heat": "weighted GCN on top-k fractional heat-kernel affinity",
     }
@@ -2406,13 +2158,10 @@ def suggest_neural_config(
     lr = float(trial.suggest_categorical("learning_rate", NEURAL_LR_GRID))
     wd = float(trial.suggest_categorical("weight_decay", NEURAL_WEIGHT_DECAY_GRID))
     heads = 4
-    h2_layers = 2
     heat_t = 1.0
     heat_s = 1.0
     if method == "GAT":
         heads = int(trial.suggest_categorical("heads", GAT_HEADS_GRID))
-    if method == "H2GCN":
-        h2_layers = int(trial.suggest_categorical("h2_layers", H2_LAYERS_GRID))
     if method == "Heat-GCN":
         heat_t = float(trial.suggest_categorical("heat_t", HEAT_TIME_GRID))
         heat_s = 1.0
@@ -2427,7 +2176,6 @@ def suggest_neural_config(
         learning_rate=lr,
         weight_decay=wd,
         heads=heads,
-        h2_layers=h2_layers,
         heat_t=heat_t,
         heat_s=heat_s,
         self_training_rounds=rounds,
@@ -3358,7 +3106,6 @@ def main() -> None:
         "neural_optuna_pruning": ENABLE_NEURAL_OPTUNA_PRUNING,
         "optuna_pruner_startup_trials": OPTUNA_PRUNER_STARTUP_TRIALS,
         "neural_tuning_progress_every": NEURAL_TUNING_PROGRESS_EVERY,
-        "mixhop_precompute_input_powers": MIXHOP_PRECOMPUTE_INPUT_POWERS,
         "device": str(DEVICE),
         "pennylane_version": str(qml.__version__),
         "pennylane_preferred_device": PENNYLANE_DEVICE,
